@@ -1,0 +1,8 @@
+create keyspace usertable;
+use usertable;
+
+create column family data with comparator=UTF8Type
+     and default_validation_class=UTF8Type
+     and key_validation_class=UTF8Type
+     and compression_options={sstable_compression:SnappyCompressor, chunk_length_kb:64};
+

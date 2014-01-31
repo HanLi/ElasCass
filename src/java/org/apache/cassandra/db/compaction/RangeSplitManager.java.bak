@@ -1,0 +1,498 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.compaction;
+
+import java.io.File;
+import java.io.IOError;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
+
+import org.apache.cassandra.cache.AutoSavingCache;
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.index.SecondaryIndex;
+import org.apache.cassandra.db.index.SecondaryIndexBuilder;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.service.AntiEntropyService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Predicates;
+import com.google.common.collect.Iterators;
+
+/**
+ * A singleton which manages a private executor of ongoing range split
+ */
+public class RangeSplitManager
+{
+    private static final Logger logger = LoggerFactory.getLogger(RangeSplitManager.class);
+    public static final RangeSplitManager instance = new RangeSplitManager();
+
+    private final ReentrantReadWriteLock compactionLock = new ReentrantReadWriteLock();
+    
+    private CompactionExecutor executor = new CompactionExecutor();
+    private CompactionExecutor validationExecutor = new ValidationExecutor();
+
+    /**
+     * @return A lock, for which acquisition means no compactions can run.
+     */
+    public Lock getCompactionLock()
+    {
+        return compactionLock.writeLock();
+    }
+
+    /**
+     * Call this whenever a compaction might be needed on the given columnfamily.
+     * It's okay to over-call (within reason) since the compactions are single-threaded,
+     * and if a call is unnecessary, it will just be no-oped in the bucketing phase.
+     */
+    public Future<Integer> submitBackground(final ColumnFamilyStore cfs)
+    {
+        Callable<Integer> callable = new Callable<Integer>()
+        {
+            public Integer call() throws IOException
+            {
+                compactionLock.readLock().lock();
+                try
+                {
+                    if (!cfs.isValid())
+                        return 0;
+
+                    boolean taskExecuted = false;
+                    AbstractCompactionStrategy strategy = cfs.getCompactionStrategy();
+                    List<AbstractCompactionTask> tasks = strategy.getBackgroundTasks(getDefaultGcBefore(cfs));
+                    for (AbstractCompactionTask task : tasks)
+                    {
+                        if (!task.markSSTablesForCompaction())
+                            continue;
+
+                        taskExecuted = true;
+                        try
+                        {
+                            task.execute(executor);
+                        }
+                        finally
+                        {
+                            task.unmarkSSTables();
+                        }
+                    }
+
+                    // newly created sstables might have made other compactions eligible
+                    if (taskExecuted)
+                        submitBackground(cfs);
+                }
+                finally 
+                {
+                    compactionLock.readLock().unlock();
+                }
+                return 0;
+            }
+        };
+        return executor.submit(callable);
+    }
+
+
+    public Future<Object> submitMaximal(final ColumnFamilyStore cfStore, final int gcBefore)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                // acquire the write lock long enough to schedule all sstables
+                compactionLock.writeLock().lock();
+                try
+                {
+                    if (!cfStore.isValid())
+                        return this;
+                    AbstractCompactionStrategy strategy = cfStore.getCompactionStrategy();
+                    for (AbstractCompactionTask task : strategy.getMaximalTasks(gcBefore))
+                    {
+                        if (!task.markSSTablesForCompaction(0, Integer.MAX_VALUE))
+                            return this;
+                        try
+                        {
+                            // downgrade the lock acquisition
+                            compactionLock.readLock().lock();
+                            compactionLock.writeLock().unlock();
+                            try
+                            {
+                                return task.execute(executor);
+                            }
+                            finally
+                            {
+                                compactionLock.readLock().unlock();
+                            }
+                        }
+                        finally
+                        {
+                            task.unmarkSSTables();
+                        }
+                    }
+                }
+                finally
+                {
+                    // we probably already downgraded
+                    if (compactionLock.writeLock().isHeldByCurrentThread())
+                        compactionLock.writeLock().unlock();
+                }
+                return this;
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    public Future<Object> submitSplitRange(final ColumnFamilyStore cfs, 
+    		final Range range, final Token token, final int gcBefore)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                compactionLock.readLock().lock();
+                try
+                {
+                    if (!cfs.isValid())
+                        return this;
+
+                    // look up the sstables now that we're on the compaction executor, so we don't try to re-compact
+                    // something that was already being compacted earlier.
+                    Collection<SSTableReader> sstables = cfs.getSSTables(range);
+                    Collection<SSTableReader> toCompact;
+                    try
+                    {
+                        if (sstables.isEmpty())
+                        {
+                            logger.error("No file to compact for user defined compaction");
+                        }
+                        // attempt to schedule the set
+                        else if ((toCompact = cfs.getDataTracker().markCompacting(sstables, 1, Integer.MAX_VALUE)) != null)
+                        {
+                            // success: perform the split
+                            try
+                            {
+                                RangeSplitTask task = new RangeSplitTask(cfs, toCompact, gcBefore, range, token);
+                                task.execute(executor);
+                            }
+                            finally
+                            {
+                                cfs.getDataTracker().unmarkCompacting(toCompact);
+                            }
+                        }
+                        else
+                        {
+                            logger.error("SSTables for user defined compaction are already being compacted.");
+                        }
+                    }
+                    finally
+                    {
+                        SSTableReader.releaseReferences(sstables);
+                    }
+
+                    return this;
+                }
+                finally
+                {
+                    compactionLock.readLock().unlock();
+                }
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    // This acquire a reference on the sstable
+    // This is not efficent, do not use in any critical path
+    private SSTableReader lookupSSTable(final ColumnFamilyStore cfs, Descriptor descriptor)
+    {
+        SSTableReader found = null;
+        for (SSTableReader sstable : cfs.markCurrentSSTablesReferenced())
+        {
+            // .equals() with no other changes won't work because in sstable.descriptor, the directory is an absolute path.
+            // We could construct descriptor with an absolute path too but I haven't found any satisfying way to do that
+            // (DB.getDataFileLocationForTable() may not return the right path if you have multiple volumes). Hence the
+            // endsWith.
+            if (sstable.descriptor.toString().endsWith(descriptor.toString()))
+                found = sstable;
+            else
+                sstable.releaseReference();
+        }
+        return found;
+    }
+
+    /* Used in tests. */
+    public void disableAutoCompaction()
+    {
+        for (String ksname : Schema.instance.getNonSystemTables())
+        {
+            for (ColumnFamilyStore cfs : Table.open(ksname).getColumnFamilyStores())
+                cfs.disableAutoCompaction();
+        }
+    }
+
+    static int getDefaultGcBefore(ColumnFamilyStore cfs)
+    {
+        return cfs.isIndex()
+               ? Integer.MAX_VALUE
+               : (int) (System.currentTimeMillis() / 1000) - cfs.metadata.getGcGraceSeconds();
+    }
+    
+	public static Token getSplitTokenFor(Iterable<SSTableReader> sstables) 
+	{
+		List<Pair<Token, Double>> list = createMidTokenAndWeightPair(sstables);
+		Token token = getWeightedMidTokenFor(list);
+		return token;
+	}
+	
+	static Token getWeightedMidTokenFor(List<Pair<Token, Double>> list)
+	{	
+		IPartitioner partitioner = DatabaseDescriptor.getPartitioner();
+		
+		if(list.isEmpty())
+			return partitioner.getMinimumToken();
+		
+		while(list.size() > 1)
+		{
+			Collections.sort(list, new Comparator<Pair<Token, Double>>()
+					{
+				@Override
+				public int compare(Pair<Token, Double> o1, Pair<Token, Double> o2) 
+				{
+					// make it descendent
+					return o2.right.compareTo(o1.right);
+				}});
+			
+			Pair<Token, Double> small = list.remove(list.size()-1);
+			Pair<Token, Double> large = list.remove(list.size()-1);
+			
+			double ratio = large.right / small.right;
+			Pair<Token, Double> newPair;
+			
+			if(ratio > 11.0) //btw 1/7 and 1/15
+			{
+				newPair = new Pair<Token, Double>(large.left, small.right + large.right); // absorb
+			}
+			else if(ratio > 5.0) //btw 1/7 and 1/3
+			{
+				Token midToken = getMidToken(large.left, small.left, partitioner); // 0.5
+				midToken = getMidToken(large.left, midToken, partitioner); // 0.75
+				midToken = getMidToken(large.left, midToken, partitioner); // 0.875
+				newPair = new Pair<Token, Double>(midToken, small.right + large.right);
+			}
+			else if(ratio > 2.0) //btw 1/1 and 1/3
+			{
+				Token midToken = getMidToken(large.left, small.left, partitioner); // 0.5
+				midToken = getMidToken(large.left, midToken, partitioner); // 0.75
+				newPair = new Pair<Token, Double>(midToken, small.right + large.right);
+			}
+			else
+			{
+				Token midToken = getMidToken(large.left, small.left, partitioner); // 0.5
+				newPair = new Pair<Token, Double>(midToken, small.right + large.right);
+			}
+
+			list.add(newPair);
+		}
+		
+		return list.get(0).left;
+	}
+	
+	private static Token getMidToken(Token t1, Token t2, IPartitioner partitioner)
+	{
+		if(t1.compareTo(t2) > 0)
+			return partitioner.midpoint(t2, t1);
+		
+		return partitioner.midpoint(t1, t2);
+	}
+	
+	private static List<Pair<Token, Double>> createMidTokenAndWeightPair(Iterable<SSTableReader> sstables)
+	{
+		List<Pair<Token, Double>> list = new ArrayList<Pair<Token, Double>>();
+		IPartitioner partitioner = DatabaseDescriptor.getPartitioner();
+
+		for(SSTableReader sstable : sstables)
+		{
+			Token mid = partitioner.midpoint(sstable.first.token, sstable.last.token);
+			Pair<Token, Double> pair = new Pair<Token, Double>(mid, (double)sstable.bytesOnDisk());
+			list.add(pair);
+		}
+		
+		return list;
+	}
+
+    private static class ValidationCompactionIterable extends CompactionIterable
+    {
+        public ValidationCompactionIterable(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, Range range) throws IOException
+        {
+            super(OperationType.VALIDATION,
+                  getScanners(sstables, range),
+                  new CompactionController(cfs, sstables, getDefaultGcBefore(cfs), true));
+        }
+
+        protected static List<SSTableScanner> getScanners(Iterable<SSTableReader> sstables, Range range) throws IOException
+        {
+            ArrayList<SSTableScanner> scanners = new ArrayList<SSTableScanner>();
+            for (SSTableReader sstable : sstables)
+                scanners.add(sstable.getDirectScanner(range));
+            return scanners;
+        }
+    }
+
+    public int getActiveCompactions()
+    {
+        return CompactionExecutor.compactions.size();
+    }
+
+    private static class CompactionExecutor extends DebuggableThreadPoolExecutor implements CompactionExecutorStatsCollector
+    {
+        // a synchronized identity set of running tasks to their compaction info
+        private static final Set<CompactionInfo.Holder> compactions = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<CompactionInfo.Holder, Boolean>()));
+
+        protected CompactionExecutor(int minThreads, int maxThreads, String name, BlockingQueue<Runnable> queue)
+        {
+            super(minThreads, maxThreads, 60, TimeUnit.SECONDS, queue, new NamedThreadFactory(name, Thread.MIN_PRIORITY));
+        }
+
+        private CompactionExecutor(int threadCount, String name)
+        {
+            this(threadCount, threadCount, name, new LinkedBlockingQueue<Runnable>());
+        }
+
+        public CompactionExecutor()
+        {
+            this(Math.max(1, DatabaseDescriptor.getConcurrentCompactors()), "CompactionExecutor");
+        }
+
+        public void beginCompaction(CompactionInfo.Holder ci)
+        {
+            compactions.add(ci);
+        }
+
+        public void finishCompaction(CompactionInfo.Holder ci)
+        {
+            compactions.remove(ci);
+        }
+
+        public static List<CompactionInfo.Holder> getCompactions()
+        {
+            return new ArrayList<CompactionInfo.Holder>(compactions);
+        }
+    }
+
+    private static class ValidationExecutor extends CompactionExecutor
+    {
+        public ValidationExecutor()
+        {
+            super(1, Integer.MAX_VALUE, "ValidationExecutor", new SynchronousQueue<Runnable>());
+        }
+    }
+
+    public interface CompactionExecutorStatsCollector
+    {
+        void beginCompaction(CompactionInfo.Holder ci);
+        void finishCompaction(CompactionInfo.Holder ci);
+    }
+
+    public List<CompactionInfo> getCompactions()
+    {
+        List<CompactionInfo> out = new ArrayList<CompactionInfo>();
+        for (CompactionInfo.Holder ci : CompactionExecutor.getCompactions())
+            out.add(ci.getCompactionInfo());
+        return out;
+    }
+
+    public List<String> getCompactionSummary()
+    {
+        List<String> out = new ArrayList<String>();
+        for (CompactionInfo.Holder ci : CompactionExecutor.getCompactions())
+            out.add(ci.getCompactionInfo().toString());
+        return out;
+    }
+
+    public int getPendingTasks()
+    {
+        int n = 0;
+        for (String tableName : Schema.instance.getTables())
+        {
+            for (ColumnFamilyStore cfs : Table.open(tableName).getColumnFamilyStores())
+            {
+                n += cfs.getCompactionStrategy().getEstimatedRemainingTasks();
+            }
+        }
+        return (int) (executor.getTaskCount() + validationExecutor.getTaskCount() - executor.getCompletedTaskCount() - validationExecutor.getCompletedTaskCount()) + n;
+    }
+
+    public long getCompletedTasks()
+    {
+        return executor.getCompletedTaskCount() + validationExecutor.getCompletedTaskCount();
+    }
+    
+    private static class SimpleFuture implements Future
+    {
+        private Runnable runnable;
+        
+        private SimpleFuture(Runnable r) 
+        {
+            runnable = r;
+        }
+        
+        public boolean cancel(boolean mayInterruptIfRunning)
+        {
+            throw new IllegalStateException("May not call SimpleFuture.cancel()");
+        }
+
+        public boolean isCancelled()
+        {
+            return false;
+        }
+
+        public boolean isDone()
+        {
+            return runnable == null;
+        }
+
+        public Object get() throws InterruptedException, ExecutionException
+        {
+            runnable.run();
+            runnable = null;
+            return runnable;
+        }
+
+        public Object get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException
+        {
+            throw new IllegalStateException("May not call SimpleFuture.get(long, TimeUnit)");
+        }
+    }
+}
